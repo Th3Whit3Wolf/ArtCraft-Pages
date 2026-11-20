@@ -1,0 +1,22 @@
+{
+  "apps": [
+    {
+      "id": "blender",
+      "name": "Blender",
+      "tagline": "3D modeling, animation and rendering, compiled to WebAssembly",
+      "repo": "heyputer/blender-wasm",
+      "publisher": "Puter",
+      "color": "#e87d0d",
+      "ink_light": "#b85e00",
+      "ink_dark": "#ffa64d",
+      "asset_patterns": [
+        "^blender-web-v?(?P<version>\\d[\\w.+-]*)\\.tar\\.gz$",
+        "^blender\\d+(-\\d+)?\\.tar\\.gz$"
+      ],
+      "cross_origin_isolation": true,
+      "strip_scripts": [
+        "plausible.io"
+      ]
+    }
+  ]
+}
