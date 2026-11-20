@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -60,7 +61,7 @@ PRECOMPRESSED = (".gz", ".br")
 TEXT_EXTS = {".html", ".htm", ".js", ".mjs", ".css", ".json", ".webmanifest"}
 STAMP = ".artcraft-build.json"
 # Bump when unpacking/patching changes, so cached apps are re-processed.
-BUILDER_VERSION = 2
+BUILDER_VERSION = 3
 
 
 def log(msg: str) -> None:
@@ -162,6 +163,8 @@ class App:
     asset_digest: str
     path: str = ""
     icon: str = ""
+    isolate: bool = False                 # needs cross-origin isolation (SharedArrayBuffer)
+    strip_scripts: tuple = ()             # remove <script src> tags whose URL contains these
 
 
 def pretty_name(slug: str) -> str:
@@ -229,8 +232,33 @@ def find_web_release(full_name: str, repo: dict, catalog: dict, token: str | Non
 # --------------------------------------------------------------------------- #
 # Unpacking
 # --------------------------------------------------------------------------- #
-def safe_extract(data: bytes, dest: Path) -> None:
+def _check_member(dest: Path, name: str) -> Path:
+    name = name.replace("\\", "/")
+    if name.startswith("/") or ".." in PurePosixPath(name).parts:
+        raise ValueError(f"unsafe path in archive: {name}")
+    target = (dest / name).resolve()
+    if target != dest and dest not in target.parents:
+        raise ValueError(f"unsafe path in archive: {name}")
+    return target
+
+
+def safe_extract(data: bytes, dest: Path, name: str = ".zip") -> None:
+    """Extract a .zip or .tar(.gz/.xz/.bz2) archive, refusing paths that escape
+    `dest` and skipping links and special files."""
     dest = dest.resolve()
+    if re.search(r"\.(tar(\.(gz|xz|bz2))?|tgz)$", name, re.I):
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+            for m in tf.getmembers():
+                if not (m.isfile() or m.isdir()):
+                    continue
+                target = _check_member(dest, m.name)
+                if m.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tf.extractfile(m) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+        return
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for info in zf.infolist():
             name = info.filename.replace("\\", "/")
@@ -355,6 +383,151 @@ def repair_relative_imports(app_dir: Path) -> list[str]:
     return fixed
 
 
+# --------------------------------------------------------------------------- #
+# Cross-origin isolation on GitHub Pages
+# --------------------------------------------------------------------------- #
+# Apps that use WebAssembly threads need SharedArrayBuffer, which browsers only
+# allow when the page is served with COOP/COEP headers. GitHub Pages can't set
+# headers, so a service worker scoped to the app's folder adds them to every
+# response. The app's own module scripts are held back until the page is
+# isolated, so the app never starts (and downloads its wasm) only to reload.
+
+COI_SW = """\
+// Adds the cross-origin isolation headers GitHub Pages can't send.
+const COEP = new URL(self.location).searchParams.get("coep") || "require-corp";
+self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", (e) => {
+  const req = e.request;
+  if (req.cache === "only-if-cached" && req.mode !== "same-origin") return;
+  e.respondWith((async () => {
+    const r = COEP === "credentialless" && req.mode === "no-cors"
+      ? new Request(req, { credentials: "omit" }) : req;
+    const res = await fetch(r);
+    if (res.status === 0) return res;  // opaque: headers can't be changed
+    const h = new Headers(res.headers);
+    h.set("Cross-Origin-Embedder-Policy", COEP);
+    h.set("Cross-Origin-Opener-Policy", "same-origin");
+    if (!h.has("Cross-Origin-Resource-Policy")) h.set("Cross-Origin-Resource-Policy", "cross-origin");
+    return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h });
+  })());
+});
+"""
+
+COI_LOADER = """<script data-coi-loader>
+(() => {
+  // Start the scripts held back below (type="text/coi-deferred").
+  const start = () => document.querySelectorAll('script[type="text/coi-deferred"]').forEach((old) => {
+    const s = document.createElement("script");
+    for (const a of old.attributes) if (a.name !== "type") s.setAttribute(a.name, a.value);
+    s.type = old.dataset.coiType || "module";
+    s.removeAttribute("data-coi-type");
+    s.text = old.text;
+    old.replaceWith(s);
+  });
+  const go = () => document.readyState === "loading" ? addEventListener("DOMContentLoaded", start) : start();
+  const KEY = "coi-reloaded";
+  let tried = false;
+  try { tried = sessionStorage.getItem(KEY) === "1"; } catch {}
+  if (window.crossOriginIsolated || !window.isSecureContext || !navigator.serviceWorker || tried) {
+    try { sessionStorage.removeItem(KEY); } catch {}
+    if (!window.crossOriginIsolated) console.warn("Not cross-origin isolated; threads (SharedArrayBuffer) unavailable.");
+    return go();
+  }
+  const coep = window.chrome ? "credentialless" : "require-corp";
+  const reload = () => { try { sessionStorage.setItem(KEY, "1"); } catch {} location.reload(); };
+  navigator.serviceWorker.register("./coi-sw.js?coep=" + coep).then(() => {
+    if (navigator.serviceWorker.controller) reload();
+    else navigator.serviceWorker.addEventListener("controllerchange", reload, { once: true });
+  }, (err) => { console.error("coi service worker failed:", err); go(); });
+})();
+</script>"""
+
+
+def add_isolation_shim(app_dir: Path) -> None:
+    (app_dir / "coi-sw.js").write_text(COI_SW, encoding="utf-8")
+    index = app_dir / "index.html"
+    text = index.read_text(encoding="utf-8", errors="surrogateescape")
+    if "data-coi-loader" in text:
+        return
+
+    def hold(m: re.Match) -> str:
+        tag = m.group(0)
+        tm = re.search(r'\btype\s*=\s*["\']([^"\']*)["\']', tag, re.I)
+        kind = (tm.group(1) if tm else "").lower()
+        if kind not in ("", "module", "text/javascript", "application/javascript"):
+            return tag  # JSON, templates, etc.
+        if kind in ("", "text/javascript", "application/javascript") and not re.search(r"\bsrc\s*=", tag, re.I):
+            return tag  # small classic inline scripts (config, analytics stubs) can run as-is
+        new_type = f'type="text/coi-deferred" data-coi-type="{kind or "text/javascript"}"'
+        return re.sub(r'\btype\s*=\s*["\'][^"\']*["\']', new_type, tag, count=1, flags=re.I) if tm \
+            else tag.replace("<script", f"<script {new_type}", 1)
+
+    text = re.sub(r"<script\b[^>]*>", hold, text, flags=re.I)
+    # The loader must run before everything else in <head>.
+    text, n = re.subn(r"(<head\b[^>]*>)", lambda m: m.group(1) + "\n" + COI_LOADER, text, count=1, flags=re.I)
+    if not n:
+        text = COI_LOADER + "\n" + text
+    index.write_text(text, encoding="utf-8", errors="surrogateescape")
+
+
+def strip_scripts(app_dir: Path, needles) -> int:
+    """Remove <script src=…> tags (and their inline stubs) whose URL contains a needle."""
+    index = app_dir / "index.html"
+    text = index.read_text(encoding="utf-8", errors="surrogateescape")
+    count = 0
+    for needle in needles:
+        pat = re.compile(r"<script\b[^>]*\bsrc\s*=\s*[\"'][^\"']*%s[^\"']*[\"'][^>]*>\s*</script>\s*" % re.escape(needle), re.I)
+        text, n = pat.subn("", text)
+        count += n
+    index.write_text(text, encoding="utf-8", errors="surrogateescape")
+    return count
+
+
+# --------------------------------------------------------------------------- #
+# Extra (non-ArtCraft) apps from extra-apps.json
+# --------------------------------------------------------------------------- #
+def natural_key(s: str):
+    """Sort key for names like blender8 < blender8-1 < blender10 (extension ignored)."""
+    s = re.sub(r"\.(tar\.(gz|xz|bz2)|tgz|zip)$", "", s, flags=re.I)
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def find_extra_release(spec: dict, token: str | None, prereleases: bool, scan: int) -> App | None:
+    full = spec["repo"]
+    repo, _ = gh_json(f"{API}/repos/{full}", token)
+    releases, _ = gh_json(f"{API}/repos/{full}/releases?per_page={scan}", token)
+    patterns = [re.compile(p, re.I) for p in spec.get("asset_patterns") or [spec["asset_pattern"]]]
+    allow_pre = spec.get("prereleases", prereleases)
+    for rel in releases:  # newest first
+        if rel.get("draft") or (rel.get("prerelease") and not allow_pre):
+            continue
+        for pat in patterns:  # patterns in order of preference
+            hits = [(a, pat.match(a["name"])) for a in rel.get("assets", [])]
+            hits = [(a, m) for a, m in hits if m]
+            if not hits:
+                continue
+            asset, m = max(hits, key=lambda h: natural_key(h[0]["name"]))
+            version = (m.groupdict().get("version") or rel["tag_name"]).lstrip("vV")
+            name = spec.get("name") or pretty_name(spec["id"])
+            color = spec.get("color") or color_for(name)
+            return App(
+                id=spec["id"], name=name,
+                tagline=spec.get("tagline") or (repo.get("description") or "").strip(),
+                version=version, tag=rel["tag_name"], published_at=rel.get("published_at") or "",
+                release_url=rel["html_url"], repo=repo["full_name"], repo_url=repo["html_url"],
+                website=spec.get("website", ""), color=color,
+                ink_light=spec.get("ink_light", color), ink_dark=spec.get("ink_dark", color),
+                publisher=spec.get("publisher", repo["owner"]["login"]), official=False,
+                order=spec.get("order", 20_000), prerelease=bool(rel.get("prerelease")),
+                asset_name=asset["name"], asset_url=asset["url"], asset_size=asset.get("size") or 0,
+                asset_digest=asset.get("digest") or "",
+                isolate=bool(spec.get("cross_origin_isolation")),
+                strip_scripts=tuple(spec.get("strip_scripts") or ()),
+            )
+    return None
+
+
 def favicon_of(app_dir: Path) -> str | None:
     text = (app_dir / "index.html").read_text(encoding="utf-8", errors="replace")
     for tag in re.findall(r"<link\b[^>]*>", text, re.I):
@@ -390,7 +563,7 @@ def install_app(app: App, out: Path, token: str | None, fix_paths: bool) -> None
     if app_dir.exists():
         shutil.rmtree(app_dir)
     app_dir.mkdir(parents=True)
-    safe_extract(data, app_dir)
+    safe_extract(data, app_dir, app.asset_name)
     hoist_app_root(app_dir)
     pruned = prune(app_dir)
     if pruned:
@@ -402,6 +575,11 @@ def install_app(app: App, out: Path, token: str | None, fix_paths: bool) -> None
                      encoding="utf-8", errors="surrogateescape")
     if fix_paths and (n := relativize_root_paths(app_dir)):
         log(f"    rewrote {n} root-absolute path(s)")
+    if app.strip_scripts and (n := strip_scripts(app_dir, app.strip_scripts)):
+        log(f"    removed {n} third-party script tag(s)")
+    if app.isolate:
+        add_isolation_shim(app_dir)
+        log("    added cross-origin isolation service worker")
     for path in repair_relative_imports(app_dir):
         log(f"    repaired missing module: {path}")
     for f, spec, _ in missing_refs(app_dir):
@@ -633,7 +811,7 @@ def render_index(apps: list[App], title: str) -> str:
     data = []
     for i, a in enumerate(apps):
         d = asdict(a)
-        for k in ("asset_url", "asset_digest", "order"):
+        for k in ("asset_url", "asset_digest", "order", "isolate", "strip_scripts"):
             d.pop(k)
         d["idx"] = i
         d["num"] = f"{i + 1:02d}"
@@ -658,6 +836,8 @@ def main() -> int:
                     help="catalogue URL or file for names/colours; '' to disable")
     ap.add_argument("--extra-repo", nargs="*", default=[], metavar="OWNER/REPO",
                     help="more repos to check (catalogue community apps are added automatically)")
+    ap.add_argument("--extra-apps", default=str(ROOT / "extra-apps.json"),
+                    help="JSON file of non-ArtCraft apps to add ('' to disable)")
     ap.add_argument("--include", nargs="*", default=[], help="only these app ids or repo names")
     ap.add_argument("--exclude", nargs="*", default=[], help="skip these app ids or repo names")
     ap.add_argument("--prereleases", action="store_true", help="also consider pre-releases")
@@ -724,6 +904,33 @@ def main() -> int:
         except Exception as e:  # one broken release shouldn't take down the site
             log(f"  ! failed: {e}")
             failures.append(f"{repo['full_name']}: {e}")
+            shutil.rmtree(out / app.id, ignore_errors=True)
+
+    extra_file = Path(args.extra_apps) if args.extra_apps else None
+    extras = json.loads(extra_file.read_text()).get("apps", []) if extra_file and extra_file.is_file() else []
+    for spec in extras:
+        if not wanted(spec["id"], spec["repo"].split("/")[-1]):
+            continue
+        try:
+            app = find_extra_release(spec, token, args.prereleases, args.scan)
+        except urllib.error.HTTPError as e:
+            log(f"  ! {spec['repo']}: {e.code}")
+            failures.append(f"{spec['repo']}: HTTP {e.code}")
+            continue
+        if not app:
+            log(f"  ! {spec['repo']}: no release asset matches {spec.get('asset_patterns') or spec.get('asset_pattern')}")
+            continue
+        if app.id in apps:
+            log(f"  ! {spec['repo']}: id '{app.id}' already used, skipping")
+            continue
+        log(f"• {app.name} {app.version}  ({app.repo} {app.tag}, {app.asset_name})")
+        try:
+            install_app(app, out, token, args.fix_paths)
+            fetch_icon(app, out, args.refresh_icons)
+            apps[app.id] = app
+        except Exception as e:
+            log(f"  ! failed: {e}")
+            failures.append(f"{app.repo}: {e}")
             shutil.rmtree(out / app.id, ignore_errors=True)
 
     for d in out.iterdir():
