@@ -59,6 +59,8 @@ PRECOMPRESSED = (".gz", ".br")
 
 TEXT_EXTS = {".html", ".htm", ".js", ".mjs", ".css", ".json", ".webmanifest"}
 STAMP = ".artcraft-build.json"
+# Bump when unpacking/patching changes, so cached apps are re-processed.
+BUILDER_VERSION = 2
 
 
 def log(msg: str) -> None:
@@ -307,6 +309,52 @@ def relativize_root_paths(app_dir: Path) -> int:
     return changed
 
 
+# Relative module references: `import … from "./x.js"`, `import("./x.js")`,
+# `export … from "./x.js"`, and <script src> / <link rel=modulepreload|preload href> in HTML.
+JS_REF_RE = re.compile(r"""(?:\bfrom\s*|\bimport\s*\(?\s*)["'](\.\.?/[^"'?#]+)""")
+HTML_REF_RE = re.compile(r"""<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*["'](\.\.?/[^"'?#]+)""", re.I)
+
+
+def missing_refs(app_dir: Path):
+    """Yield (referring file, referenced path) for relative module references
+    that point at a file that doesn't exist."""
+    root = app_dir.resolve()
+    for f in app_dir.rglob("*"):
+        if not f.is_file() or f.suffix.lower() not in (".js", ".mjs", ".html", ".htm"):
+            continue
+        if f.stat().st_size > 20_000_000:
+            continue
+        text = f.read_text(encoding="utf-8", errors="replace")
+        rx = HTML_REF_RE if f.suffix.lower() in (".html", ".htm") else JS_REF_RE
+        for spec in set(rx.findall(text)):
+            target = (f.parent / spec).resolve()
+            if (target == root or root in target.parents) and not target.exists():
+                yield f, spec, target
+
+
+def repair_relative_imports(app_dir: Path) -> list[str]:
+    """Work around upstream packaging slips where a module in a subfolder
+    imports "./x" but x only ships at the app root (PhotoCraft 0.23.1:
+    app/photocraft-web.js -> ./snippets/…, shipped as /snippets/…).
+    Copies the root-level file to where the import expects it."""
+    root = app_dir.resolve()
+    fixed: list[str] = []
+    for _ in range(5):  # copied files may import further files
+        changed = False
+        for f, spec, target in list(missing_refs(app_dir)):
+            rel = PurePosixPath(spec)
+            parts = [p for p in rel.parts if p not in (".", "..")]
+            source = root.joinpath(*parts)
+            if source.is_file() and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                fixed.append(target.relative_to(root).as_posix())
+                changed = True
+        if not changed:
+            break
+    return fixed
+
+
 def favicon_of(app_dir: Path) -> str | None:
     text = (app_dir / "index.html").read_text(encoding="utf-8", errors="replace")
     for tag in re.findall(r"<link\b[^>]*>", text, re.I):
@@ -325,7 +373,8 @@ def install_app(app: App, out: Path, token: str | None, fix_paths: bool) -> None
     app.path = f"{app.id}/"
     if stamp.is_file():
         try:
-            if json.loads(stamp.read_text()).get("asset_name") == app.asset_name:
+            prev = json.loads(stamp.read_text())
+            if prev.get("asset_name") == app.asset_name and prev.get("builder") == BUILDER_VERSION:
                 log(f"  = up to date, skipping download")
                 return
         except json.JSONDecodeError:
@@ -353,7 +402,11 @@ def install_app(app: App, out: Path, token: str | None, fix_paths: bool) -> None
                      encoding="utf-8", errors="surrogateescape")
     if fix_paths and (n := relativize_root_paths(app_dir)):
         log(f"    rewrote {n} root-absolute path(s)")
-    stamp.write_text(json.dumps({"asset_name": app.asset_name}))
+    for path in repair_relative_imports(app_dir):
+        log(f"    repaired missing module: {path}")
+    for f, spec, _ in missing_refs(app_dir):
+        log(f"    warning: {f.relative_to(app_dir).as_posix()} references missing {spec}")
+    stamp.write_text(json.dumps({"asset_name": app.asset_name, "builder": BUILDER_VERSION}))
 
 
 def fetch_icon(app: App, out: Path, refresh: bool) -> None:
@@ -691,7 +744,10 @@ def main() -> int:
                  for a in ordered]}, indent=2))
     (out / ".nojekyll").touch()
 
-    log(f"\nBuilt {len(ordered)} app(s) into {out}/")
+    total = sum(p.stat().st_size for p in out.rglob("*") if p.is_file() and not p.name.startswith("."))
+    log(f"\nBuilt {len(ordered)} app(s) into {out}/ ({total / 1e6:.0f} MB)")
+    if total > 900e6:
+        log("warning: GitHub Pages sites are limited to 1 GB; use --exclude to drop the largest apps")
     if failures:
         log("Failures:\n  " + "\n  ".join(failures))
     return 1 if failures and not ordered else 0
